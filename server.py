@@ -41,6 +41,7 @@ Variables de entorno necesarias (en Render, no en este archivo):
 import os
 import json
 import datetime
+import traceback
 from typing import Optional
 
 import requests
@@ -78,7 +79,7 @@ def _upstash_set(key: str, value: dict):
         f"{url}/set/{key}",
         headers={"Authorization": f"Bearer {token}"},
         data=json.dumps(value),
-        timeout=10,
+        timeout=30,
     )
     resp.raise_for_status()
 
@@ -93,7 +94,7 @@ def _upstash_get(key: str) -> Optional[dict]:
     resp = requests.get(
         f"{url}/get/{key}",
         headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
+        timeout=30,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -125,67 +126,82 @@ async def ingest(request: Request) -> JSONResponse:
     try:
         payload = await request.json()
     except Exception:
+        print("Error decodificando el JSON recibido en /ingest:")
+        traceback.print_exc()
         return JSONResponse({"error": "JSON inválido"}, status_code=400)
 
-    # Soporta tanto el formato real de Health Auto Export ({"data": {...}})
-    # como un envío simple directo ({"metrics": ..., "workouts": ...}).
-    data = payload.get("data", payload)
-    metrics = data.get("metrics", []) or []
-    workouts = data.get("workouts", []) or []
+    try:
+        # Soporta tanto el formato real de Health Auto Export ({"data": {...}})
+        # como un envío simple directo ({"metrics": ..., "workouts": ...}).
+        data = payload.get("data", payload)
+        metrics = data.get("metrics", []) or []
+        workouts = data.get("workouts", []) or []
+        print(
+            f"/ingest recibido: {len(metrics)} métricas, {len(workouts)} entrenamientos"
+        )
 
-    days: dict = {}
+        days: dict = {}
 
-    def bucket_for(day: str) -> dict:
-        return days.setdefault(day, {"date": day, "metrics": {}, "workouts": []})
+        def bucket_for(day: str) -> dict:
+            return days.setdefault(day, {"date": day, "metrics": {}, "workouts": []})
 
-    for metric in metrics:
-        name = metric.get("name", "unknown")
-        for point in metric.get("data", []) or []:
-            ts = point.get("date", "")
+        for metric in metrics:
+            name = metric.get("name", "unknown")
+            for point in metric.get("data", []) or []:
+                ts = point.get("date", "")
+                day = _day_from_timestamp(ts)
+                if not day:
+                    continue
+                b = bucket_for(day)
+                b["metrics"].setdefault(name, []).append(point)
+
+        for workout in workouts:
+            ts = (
+                workout.get("start")
+                or workout.get("startDate")
+                or workout.get("date")
+                or ""
+            )
             day = _day_from_timestamp(ts)
             if not day:
                 continue
-            b = bucket_for(day)
-            b["metrics"].setdefault(name, []).append(point)
+            bucket_for(day)["workouts"].append(workout)
 
-    for workout in workouts:
-        ts = (
-            workout.get("start")
-            or workout.get("startDate")
-            or workout.get("date")
-            or ""
-        )
-        day = _day_from_timestamp(ts)
-        if not day:
-            continue
-        bucket_for(day)["workouts"].append(workout)
+        if not days:
+            # Nada reconocible en el payload; guarda igualmente bajo hoy, para
+            # poder inspeccionarlo si algo viene con un formato distinto.
+            days[_today()] = {"date": _today(), "raw": payload}
 
-    if not days:
-        # Nada reconocible en el payload; guarda igualmente bajo hoy, para
-        # poder inspeccionarlo si algo viene con un formato distinto.
-        days[_today()] = {"date": _today(), "raw": payload}
+        print(f"/ingest: {len(days)} día(s) a guardar: {list(days.keys())}")
 
-    saved_dates = []
-    for day, bucket in days.items():
-        key = f"healthdata:{day}"
-        try:
-            existing = _upstash_get(key)
-        except Exception:
-            existing = None
-        if isinstance(existing, dict) and "metrics" in existing:
-            merged_metrics = existing.get("metrics", {})
-            for name, points in bucket["metrics"].items():
-                merged_metrics.setdefault(name, [])
-                merged_metrics[name].extend(points)
-            bucket["metrics"] = merged_metrics
-            bucket["workouts"] = (existing.get("workouts") or []) + bucket["workouts"]
-        try:
+        saved_dates = []
+        for day, bucket in days.items():
+            key = f"healthdata:{day}"
+            try:
+                existing = _upstash_get(key)
+            except Exception:
+                print(f"No se pudo leer {key} (se ignora, se sobrescribe):")
+                traceback.print_exc()
+                existing = None
+            if isinstance(existing, dict) and "metrics" in existing:
+                merged_metrics = existing.get("metrics", {})
+                for name, points in bucket["metrics"].items():
+                    merged_metrics.setdefault(name, [])
+                    merged_metrics[name].extend(points)
+                bucket["metrics"] = merged_metrics
+                bucket["workouts"] = (existing.get("workouts") or []) + bucket[
+                    "workouts"
+                ]
             _upstash_set(key, bucket)
             saved_dates.append(day)
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
+            print(f"Guardado {key} correctamente.")
 
-    return JSONResponse({"status": "guardado", "dates": saved_dates})
+        return JSONResponse({"status": "guardado", "dates": saved_dates})
+
+    except Exception as e:
+        print("FALLO en /ingest:")
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # --- Herramientas expuestas a Claude -------------------------------------
